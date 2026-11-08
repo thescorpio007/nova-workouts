@@ -37,7 +37,7 @@ button{cursor:pointer}
 .dow div{text-align:center;font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
 .day{aspect-ratio:1;max-width:100%;border:none;background:transparent;border-radius:8px;position:relative;display:flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums;font-size:.95rem}
 .day.empty{visibility:hidden}
-@supports not (aspect-ratio:1){.day{height:0;padding-bottom:100%}}
+@supports not (aspect-ratio:1){.day{height:46px}.day .mark{inset:auto;left:50%;top:50%;width:34px;height:34px;margin:-17px 0 0 -17px}}
 .day.future{color:var(--muted);opacity:.55}
 .day.today{box-shadow:inset 0 0 0 1.5px var(--ink)}
 .day.sel{background:var(--jade-soft)}
