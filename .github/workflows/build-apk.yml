@@ -1,0 +1,183 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Signing key
+        env:
+          NOVA_WORKOUTS_KEY: ${{ secrets.NOVA_WORKOUTS_KEY }}
+        run: |
+          if [ -z "$NOVA_WORKOUTS_KEY" ]; then
+            echo "::error title=Signing key missing::Add the NOVA_WORKOUTS_KEY secret in Settings > Secrets and variables > Actions"
+            # still compile, so code errors show up while the key is being added
+            gradle :app:compileReleaseKotlin --no-daemon 2>&1 | tee build.log || true
+            grep -E "^e: |error:" build.log | head -30 | while read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in keystore/nova-workouts.jks.enc \
+            -out keystore/nova-workouts.jks -pass env:NOVA_WORKOUTS_KEY || {
+            echo "::error title=Signing key::NOVA_WORKOUTS_KEY is set but could not open the key (check it was copied exactly)"; exit 1; }
+          printf 'password=%s\n' "$NOVA_WORKOUTS_KEY" > keystore/signing.properties
+          echo "::notice title=Signing key::ready"
+
+      - name: Build
+        env:
+          NOVA_BUILD: ${{ github.run_number }}
+        run: |
+          set -o pipefail
+          gradle :app:assembleRelease --no-daemon 2>&1 | tee build.log || {
+            grep -E "^e: |error:" build.log | head -20 | while read -r l; do echo "::error::$l"; done
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: app/build/outputs/apk/release/*.apk
+
+      - name: Checksums signed with the app's own key (the app checks them before updating)
+        env:
+          KP: ${{ secrets.NOVA_WORKOUTS_KEY }}
+        run: |
+          set -e
+          cd app/build/outputs/apk/release
+          sha256sum *.apk > SHA256SUMS.txt
+          keytool -importkeystore -noprompt -srckeystore "$GITHUB_WORKSPACE/keystore/nova-workouts.jks" -srcalias novaworkouts \
+            -srcstorepass:env KP -srckeypass:env KP -destkeystore /tmp/k.p12 -deststoretype PKCS12 -deststorepass:env KP -destkeypass:env KP
+          openssl pkcs12 -in /tmp/k.p12 -nocerts -nodes -passin env:KP -out /tmp/k.pem
+          openssl pkcs12 -in /tmp/k.p12 -nokeys -clcerts -passin env:KP | openssl x509 -pubkey -noout > /tmp/pub.pem
+          openssl dgst -sha256 -sign /tmp/k.pem -out SHA256SUMS.sig SHA256SUMS.txt
+          openssl dgst -sha256 -verify /tmp/pub.pem -signature SHA256SUMS.sig SHA256SUMS.txt
+          rm -f /tmp/k.p12 /tmp/k.pem
+          cat SHA256SUMS.txt
+          echo "::notice title=Checksums::SHA256SUMS.txt signed and verified"
+
+      - name: Release (marked pre-release until the short test passes)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOVA_BUILD: ${{ github.run_number }}
+        run: |
+          n=$(printf '%02d' "$NOVA_BUILD")
+          cd app/build/outputs/apk/release
+          gh release create "build-$n" *.apk SHA256SUMS.txt SHA256SUMS.sig \
+            --title "Nova Workouts 1.0 · build $n" \
+            --notes "Nova Workouts 1.0 · build $n — tap the .apk below to download and install. Designed by A.HAMROUNI" \
+            --prerelease
+
+  smoke-test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: apk
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Short test script
+        run: |
+          mkdir -p shots
+          cat > shots.sh <<'SH'
+          set -x
+          P=com.nova.workouts
+          shot() { sleep 4; adb shell screencap -p /sdcard/s.png; adb pull /sdcard/s.png "shots/$1.png"; }
+          S=$(adb shell wm size | grep -o '[0-9]*x[0-9]*' | tail -1); W=${S%x*}; H=${S#*x}
+          scroll() { adb shell input swipe $((W/2)) $((H*8/10)) $((W/2)) $((H*25/100)) 500; }
+          adb install -r apk/*.apk
+          adb shell pm grant $P android.permission.POST_NOTIFICATIONS || true
+          adb logcat -c
+          adb shell am start -W -n $P/.MainActivity --ez selftest true; sleep 15
+          adb logcat -d -s NOVA_SELFTEST:I > selftest.txt; cat selftest.txt
+          grep -q "PASS" selftest.txt || { echo "::error title=Backup self-test::$(grep NOVA_SELFTEST selftest.txt | tail -1)"; exit 1; }
+          echo "::notice title=Backup self-test::$(grep NOVA_SELFTEST selftest.txt | tail -1 | cut -c1-400)"
+          adb shell am force-stop $P
+          adb logcat -c
+          adb shell am start -W -n $P/.MainActivity --es updtest "build-$(printf '%02d' ${{ github.run_number }})"
+          for i in $(seq 1 24); do sleep 5; adb logcat -d -s NOVA_UPDTEST:I > updtest.txt; grep -q "PASS\|FAIL" updtest.txt && break; done; cat updtest.txt
+          grep -q "PASS" updtest.txt || { echo "::error title=Update self-test::$(grep NOVA_UPDTEST updtest.txt | tail -1 | cut -c1-400)"; exit 1; }
+          echo "::notice title=Update self-test::$(grep NOVA_UPDTEST updtest.txt | tail -1 | cut -c1-400)"
+          adb shell am force-stop $P
+          adb shell am start -W -n $P/.MainActivity; sleep 6; shot 01-home
+          for k in 2 3 4 5 6 7; do scroll; shot "0$k-home-$k"; done
+          adb shell am force-stop $P
+          adb shell am start -W -n $P/.MainActivity --ez settings true; sleep 6; shot 10-profile
+          for k in 1 2 3 4; do scroll; shot "1$k-settings-$k"; done
+          adb shell am start -W -n $P/.UpdateActivity; shot 20-update
+          adb shell input keyevent 4
+          sleep 2
+          adb logcat -d > logcat.txt
+          if grep -q "FATAL EXCEPTION" logcat.txt; then grep -A 25 "FATAL EXCEPTION" logcat.txt | sed 's/^/::error::/'; exit 1; fi
+          echo "SHORT TEST OK"
+          SH
+
+      - name: Short test on an emulator (with screenshots)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          profile: pixel_5
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          script: bash shots.sh
+
+      - name: Attach screenshots to the release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOVA_BUILD: ${{ github.run_number }}
+        run: |
+          n=$(printf '%02d' "$NOVA_BUILD")
+          ls shots/*.png >/dev/null 2>&1 && gh release upload "build-$n" shots/*.png --clobber --repo "$GITHUB_REPOSITORY" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            logcat.txt
+            shots/
+
+  publish:
+    needs: smoke-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test passed — publish for the app's automatic updates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOVA_BUILD: ${{ github.run_number }}
+        run: |
+          n=$(printf '%02d' "$NOVA_BUILD")
+          gh release edit "build-$n" --prerelease=false --latest -R "$GITHUB_REPOSITORY"
+          echo "::notice title=Published::build-$n is now the latest release (phones will update to it)"

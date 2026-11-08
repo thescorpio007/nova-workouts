@@ -1,0 +1,8 @@
+# Nova Workouts
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+keystore/*.jks
+keystore/signing.properties
