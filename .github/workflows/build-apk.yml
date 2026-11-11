@@ -59,6 +59,7 @@ jobs:
         with:
           name: apk
           path: app/build/outputs/apk/release/*.apk
+          retention-days: 3
 
       - name: Checksums signed with the app's own key (the app checks them before updating)
         env:
@@ -168,6 +169,7 @@ jobs:
           path: |
             logcat.txt
             shots/
+          retention-days: 3
 
   publish:
     needs: smoke-test
